@@ -70,7 +70,7 @@ public class AudioExtractorService {
                 log.error("yt-dlp failed with exit code {}: {}", exitCode, processOutput);
                 throw new FactCheckException(
                         "Failed to download audio. yt-dlp exit code: " + exitCode +
-                        ". Make sure the URL is valid and yt-dlp is installed.");
+                        ". Reason: " + (processOutput.length() > 200 ? processOutput.substring(0, 200) + "..." : processOutput));
             }
 
             // yt-dlp may produce a file with a slightly different extension, find it
