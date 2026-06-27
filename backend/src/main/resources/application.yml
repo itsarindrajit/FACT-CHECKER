@@ -1,0 +1,42 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: reel-fact-checker
+
+  # Spring AI - Gemini via OpenAI-compatible endpoint
+  ai:
+    openai:
+      api-key: ${GEMINI_API_KEY}
+      base-url: https://generativelanguage.googleapis.com/v1beta/openai
+      chat:
+        options:
+          model: gemini-3.1-flash-lite
+          temperature: 0.2
+
+  # Disable default Spring AI auto-config for models we don't use
+  autoconfigure:
+    exclude:
+      - org.springframework.ai.autoconfigure.embedding.EmbeddingAutoConfiguration
+
+# Custom application properties
+app:
+  groq:
+    api-key: ${GROQ_API_KEY}
+    base-url: https://api.groq.com/openai/v1
+    model: whisper-large-v3
+
+  tavily:
+    api-key: ${TAVILY_API_KEY}
+    base-url: https://api.tavily.com
+
+  temp-dir: ${java.io.tmpdir}/fact-checker-audio
+
+  rate-limit:
+    requests-per-minute: 5
+
+logging:
+  level:
+    com.factchecker: DEBUG
+    org.springframework.ai: INFO
