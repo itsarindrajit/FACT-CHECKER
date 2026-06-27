@@ -1,20 +1,17 @@
 # Stage 1: Build the application
-FROM eclipse-temurin:21-jdk AS builder
+FROM maven:3.9.6-eclipse-temurin-21 AS builder
 
 WORKDIR /app
 
-# Copy Maven wrapper and pom.xml first for dependency caching
+# Copy pom.xml first for dependency caching
 COPY pom.xml .
-COPY .mvn .mvn
-COPY mvnw .
-RUN chmod +x mvnw
 
 # Download dependencies (cached layer)
-RUN ./mvnw dependency:resolve -B
+RUN mvn dependency:go-offline -B
 
 # Copy source and build
 COPY src src
-RUN ./mvnw package -DskipTests -B
+RUN mvn package -DskipTests -B
 
 # Stage 2: Runtime image with Python, yt-dlp, and ffmpeg
 FROM eclipse-temurin:21-jre
