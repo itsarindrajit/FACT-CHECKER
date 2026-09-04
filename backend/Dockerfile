@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     nodejs \
     ffmpeg \
-    && pip3 install --break-system-packages yt-dlp bgutil-ytdlp-pot-provider \
+    && pip3 install --no-cache-dir -U --break-system-packages yt-dlp bgutil-ytdlp-pot-provider \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
