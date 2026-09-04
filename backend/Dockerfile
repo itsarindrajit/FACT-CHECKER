@@ -16,12 +16,13 @@ RUN mvn package -DskipTests -B
 # Stage 2: Runtime image with Python, yt-dlp, and ffmpeg
 FROM eclipse-temurin:21-jre
 
-# Install python3, pip, ffmpeg, and yt-dlp
+# Install python3, pip, ffmpeg, nodejs, and yt-dlp PO Token provider plugin
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
+    nodejs \
     ffmpeg \
-    && pip3 install --break-system-packages yt-dlp \
+    && pip3 install --break-system-packages yt-dlp bgutil-ytdlp-pot-provider \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
