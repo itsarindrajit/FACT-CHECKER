@@ -39,6 +39,7 @@ app:
     cookies-path: ${YTDLP_COOKIES_PATH:}
     po-token: ${YTDLP_PO_TOKEN:}
     po-token-client: ${YTDLP_PO_TOKEN_CLIENT:web}
+    oauth2-enabled: ${YTDLP_OAUTH2_ENABLED:true}
 
   rate-limit:
     requests-per-minute: 5

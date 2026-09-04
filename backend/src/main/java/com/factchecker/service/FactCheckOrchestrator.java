@@ -16,7 +16,10 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Orchestrates the entire fact-checking pipeline, emitting SSE progress events at each stage.
- * Pipeline: Validate URL → Download Audio → Transcribe → Extract Claims → Search Web → Verdict
+ * Pipeline: Validate URL → Get Transcript → Extract Claims → Search Web → Verdict
+ *
+ * For YouTube URLs: fetches transcript directly (no video download needed).
+ * For Instagram URLs: downloads audio via yt-dlp, then transcribes with Groq Whisper.
  */
 @Slf4j
 @Service
@@ -25,6 +28,7 @@ public class FactCheckOrchestrator {
 
     private final AudioExtractorService audioExtractor;
     private final TranscriptionService transcriptionService;
+    private final YouTubeTranscriptService youTubeTranscriptService;
     private final ClaimExtractorService claimExtractor;
     private final SearchService searchService;
     private final VerdictService verdictService;
@@ -50,19 +54,18 @@ public class FactCheckOrchestrator {
             String normalizedUrl = validation.normalizedUrl();
             log.info("Starting pipeline for {} URL: {}", validation.platform(), normalizedUrl);
 
-            // Stage 2: Download Audio
-            sink.next(ProgressEvent.stage(PipelineStage.DOWNLOADING_AUDIO,
-                    "Downloading audio from " + validation.platform() + "..."));
+            // Choose transcript strategy based on platform
+            Mono<String> transcriptMono;
 
-            audioExtractor.extractAudio(normalizedUrl)
-                .flatMap(audioPath -> {
-                    audioPathRef.set(audioPath);
+            if (validation.platform() == UrlValidator.Platform.YOUTUBE) {
+                // YouTube: Try fetching transcript directly (fast, no download needed)
+                transcriptMono = getYouTubeTranscript(sink, validation, normalizedUrl, audioPathRef);
+            } else {
+                // Instagram: Use yt-dlp audio download + Groq Whisper transcription
+                transcriptMono = getAudioTranscript(sink, validation, normalizedUrl, audioPathRef);
+            }
 
-                    // Stage 3: Transcribe
-                    sink.next(ProgressEvent.stage(PipelineStage.TRANSCRIBING,
-                            "Transcribing audio with Whisper AI..."));
-                    return transcriptionService.transcribe(audioPath);
-                })
+            transcriptMono
                 .flatMap(transcript -> {
                     // Stage 4: Extract Claims
                     sink.next(ProgressEvent.stage(PipelineStage.EXTRACTING_CLAIMS,
@@ -110,7 +113,7 @@ public class FactCheckOrchestrator {
                             });
                 })
                 .doFinally(signal -> {
-                    // Cleanup temp audio file
+                    // Cleanup temp audio file (only exists for Instagram path)
                     Path audioPath = audioPathRef.get();
                     if (audioPath != null) {
                         audioExtractor.cleanup(audioPath).subscribe();
@@ -129,4 +132,57 @@ public class FactCheckOrchestrator {
                 );
         });
     }
+
+    /**
+     * YouTube path: Fetches transcript directly without downloading video.
+     * Falls back to audio download + Groq if no transcript is available.
+     */
+    private Mono<String> getYouTubeTranscript(
+            reactor.core.publisher.FluxSink<ProgressEvent> sink,
+            UrlValidator.ValidationResult validation,
+            String normalizedUrl,
+            AtomicReference<Path> audioPathRef) {
+
+        sink.next(ProgressEvent.stage(PipelineStage.TRANSCRIBING,
+                "Fetching YouTube transcript directly..."));
+
+        return youTubeTranscriptService.fetchTranscript(validation.videoId())
+                .flatMap(transcript -> {
+                    if (transcript != null && !transcript.isBlank()) {
+                        log.info("Successfully fetched YouTube transcript directly for video {}", validation.videoId());
+                        return Mono.just(transcript);
+                    }
+                    // Transcript unavailable — fall back to yt-dlp + Groq
+                    log.info("No YouTube transcript available for {}, falling back to audio download", validation.videoId());
+                    return getAudioTranscript(sink, validation, normalizedUrl, audioPathRef);
+                })
+                .onErrorResume(e -> {
+                    log.warn("YouTube transcript fetch failed for {}: {}, falling back to audio download",
+                            validation.videoId(), e.getMessage());
+                    return getAudioTranscript(sink, validation, normalizedUrl, audioPathRef);
+                });
+    }
+
+    /**
+     * Instagram/fallback path: Downloads audio via yt-dlp, then transcribes with Groq Whisper.
+     */
+    private Mono<String> getAudioTranscript(
+            reactor.core.publisher.FluxSink<ProgressEvent> sink,
+            UrlValidator.ValidationResult validation,
+            String normalizedUrl,
+            AtomicReference<Path> audioPathRef) {
+
+        sink.next(ProgressEvent.stage(PipelineStage.DOWNLOADING_AUDIO,
+                "Downloading audio from " + validation.platform() + "..."));
+
+        return audioExtractor.extractAudio(normalizedUrl)
+                .flatMap(audioPath -> {
+                    audioPathRef.set(audioPath);
+
+                    sink.next(ProgressEvent.stage(PipelineStage.TRANSCRIBING,
+                            "Transcribing audio with Whisper AI..."));
+                    return transcriptionService.transcribe(audioPath);
+                });
+    }
 }
+
