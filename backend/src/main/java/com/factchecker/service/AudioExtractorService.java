@@ -12,6 +12,8 @@ import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -25,6 +27,15 @@ public class AudioExtractorService {
 
     @Value("${app.temp-dir}")
     private String tempDir;
+
+    @Value("${app.ytdlp.extractor-args:youtube:player_client=mweb,web_safari}")
+    private String extractorArgs;
+
+    @Value("${app.ytdlp.user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36}")
+    private String userAgent;
+
+    @Value("${app.ytdlp.cookies-path:}")
+    private String cookiesPath;
 
     /**
      * Downloads audio from the given URL and returns the path to the audio file.
@@ -42,17 +53,38 @@ public class AudioExtractorService {
 
             log.info("Extracting audio from URL: {} to {}", url, expectedOutput);
 
-            ProcessBuilder pb = new ProcessBuilder(
+            List<String> command = new ArrayList<>(List.of(
                     "yt-dlp",
                     "-x",                          // Extract audio only
                     "--audio-format", "mp3",        // Convert to mp3
                     "--audio-quality", "5",         // Medium quality (saves bandwidth)
                     "--no-playlist",                // Don't download playlists
                     "--no-warnings",                // Suppress warnings
-                    "--max-filesize", "25m",        // Max 25MB (Groq limit)
-                    "-o", outputTemplate.toString(),
-                    url
-            );
+                    "--max-filesize", "25m"         // Max 25MB (Groq limit)
+            ));
+
+            if (extractorArgs != null && !extractorArgs.isBlank()) {
+                command.add("--extractor-args");
+                command.add(extractorArgs);
+            }
+
+            if (userAgent != null && !userAgent.isBlank()) {
+                command.add("--user-agent");
+                command.add(userAgent);
+            }
+
+            if (cookiesPath != null && !cookiesPath.isBlank() && Files.exists(Paths.get(cookiesPath))) {
+                command.add("--cookies");
+                command.add(cookiesPath);
+            }
+
+            command.add("-o");
+            command.add(outputTemplate.toString());
+            command.add(url);
+
+            log.debug("Executing yt-dlp command: {}", String.join(" ", command));
+
+            ProcessBuilder pb = new ProcessBuilder(command);
 
             pb.redirectErrorStream(true);
 
