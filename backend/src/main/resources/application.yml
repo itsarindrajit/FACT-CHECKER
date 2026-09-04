@@ -34,7 +34,7 @@ app:
   temp-dir: ${java.io.tmpdir}/fact-checker-audio
 
   ytdlp:
-    extractor-args: ${YTDLP_EXTRACTOR_ARGS:youtube:player_client=mweb,web_safari}
+    extractor-args: ${YTDLP_EXTRACTOR_ARGS:youtube:player_client=android,ios,mweb}
     user-agent: ${YTDLP_USER_AGENT:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36}
     cookies-path: ${YTDLP_COOKIES_PATH:}
 
