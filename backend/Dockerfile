@@ -13,19 +13,15 @@ RUN mvn dependency:go-offline -B
 COPY src src
 RUN mvn package -DskipTests -B
 
-# Stage 2: Runtime image with Python, yt-dlp, ffmpeg, and OAuth2 plugin
+# Stage 2: Runtime image with Python, yt-dlp, and ffmpeg
 FROM eclipse-temurin:21-jre
 
-# Install python3, pip, ffmpeg, nodejs, yt-dlp with OAuth2 + PO Token plugins
+# Install python3, pip, ffmpeg, and yt-dlp
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
-    nodejs \
     ffmpeg \
-    && pip3 install --no-cache-dir -U --break-system-packages \
-       yt-dlp \
-       yt-dlp-youtube-oauth2 \
-       bgutil-ytdlp-pot-provider \
+    && pip3 install --no-cache-dir -U --break-system-packages yt-dlp \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -41,10 +37,8 @@ COPY --from=builder /app/target/*.jar app.jar
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Create temp directory for audio files and OAuth2 cache directory
-RUN mkdir -p /tmp/fact-checker-audio && chown appuser:appuser /tmp/fact-checker-audio \
-    && mkdir -p /home/appuser/.cache/yt-dlp-youtube-oauth2 \
-    && chown -R appuser:appuser /home/appuser/.cache
+# Create temp directory for audio files
+RUN mkdir -p /tmp/fact-checker-audio && chown appuser:appuser /tmp/fact-checker-audio
 
 # Switch to non-root user
 USER appuser
@@ -56,5 +50,5 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8080/api/health || exit 1
 
-# Run the application via entrypoint (restores OAuth2 token from env var)
+# Run the application via entrypoint (restores cookies from env var)
 ENTRYPOINT ["/app/entrypoint.sh"]

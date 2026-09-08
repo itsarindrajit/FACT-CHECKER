@@ -3,34 +3,31 @@ package com.factchecker.service;
 import io.github.thoroldvix.api.TranscriptApiFactory;
 import io.github.thoroldvix.api.TranscriptContent;
 import io.github.thoroldvix.api.TranscriptList;
-import io.github.thoroldvix.api.YoutubeClient;
 import io.github.thoroldvix.api.YoutubeTranscriptApi;
-import io.github.thoroldvix.api.TranscriptRetrievalException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import jakarta.annotation.PostConstruct;
-import java.io.IOException;
-import java.net.CookieManager;
-import java.net.HttpCookie;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * Fetches YouTube video transcripts (auto-generated captions) directly via HTTP.
- * Supports cookie-based authentication to bypass datacenter IP blocks on Render.
+ * Fetches YouTube video transcripts/subtitles without downloading the video.
  *
- * Falls back gracefully if no transcript is available.
+ * Strategy (in order):
+ * 1. yt-dlp subtitle extraction (--write-subs --skip-download) with cookies — most reliable on Render
+ * 2. Java youtube-transcript-api library — fast fallback for non-blocked IPs
+ * 3. Returns null → orchestrator falls back to full audio download + Groq
  */
 @Slf4j
 @Service
@@ -39,199 +36,223 @@ public class YouTubeTranscriptService {
     @Value("${app.ytdlp.cookies-path:}")
     private String cookiesPath;
 
-    private YoutubeTranscriptApi transcriptApi;
+    @Value("${app.temp-dir}")
+    private String tempDir;
 
-    @PostConstruct
-    public void init() {
-        if (cookiesPath != null && !cookiesPath.isBlank() && Files.exists(Paths.get(cookiesPath))) {
-            log.info("Initializing YouTube Transcript API with cookies from: {}", cookiesPath);
-            try {
-                CookieManager cookieManager = parseCookiesTxt(Paths.get(cookiesPath));
-                HttpClient httpClient = HttpClient.newBuilder()
-                        .cookieHandler(cookieManager)
-                        .followRedirects(HttpClient.Redirect.NORMAL)
-                        .build();
-                YoutubeClient cookieClient = new CookieYoutubeClient(httpClient);
-                this.transcriptApi = TranscriptApiFactory.createWithClient(cookieClient);
-                log.info("YouTube Transcript API initialized with cookie authentication");
-            } catch (Exception e) {
-                log.warn("Failed to parse cookies file, falling back to unauthenticated: {}", e.getMessage());
-                this.transcriptApi = TranscriptApiFactory.createDefault();
-            }
-        } else {
-            log.info("No cookies file found, using unauthenticated YouTube Transcript API");
-            this.transcriptApi = TranscriptApiFactory.createDefault();
-        }
-    }
+    private final YoutubeTranscriptApi transcriptApiLib = TranscriptApiFactory.createDefault();
+
+    // Pattern to match SRT timestamps like "00:00:01,234 --> 00:00:03,456"
+    private static final Pattern SRT_TIMESTAMP = Pattern.compile("\\d{2}:\\d{2}:\\d{2}[,.]\\d{3}\\s*-->\\s*\\d{2}:\\d{2}:\\d{2}[,.]\\d{3}");
+    // Pattern to match SRT sequence numbers (just digits on a line)
+    private static final Pattern SRT_INDEX = Pattern.compile("^\\d+$");
 
     /**
-     * Attempts to fetch the transcript for a YouTube video by its video ID.
-     * Tries English first, then any auto-generated language, then translates to English.
-     *
-     * @param videoId the 11-character YouTube video ID
-     * @return Mono containing the transcript text, or Mono.empty() if unavailable
+     * Attempts to fetch the transcript for a YouTube video.
+     * Returns null if no transcript can be obtained.
      */
     public Mono<String> fetchTranscript(String videoId) {
         return Mono.fromCallable(() -> {
             log.info("Fetching YouTube transcript for video ID: {}", videoId);
 
-            TranscriptList transcriptList = transcriptApi.listTranscripts(videoId);
-
-            TranscriptContent content = null;
-
-            // Try 1: Look for manually created or auto-generated English transcript
-            try {
-                content = transcriptList.findTranscript("en", "en-US", "en-GB").fetch();
-                log.info("Found English transcript for video {}", videoId);
-            } catch (Exception e) {
-                log.debug("No English transcript found for {}, trying auto-generated...", videoId);
+            // Strategy 1: yt-dlp subtitle extraction with cookies (most reliable on Render)
+            String transcript = fetchViaYtDlpSubtitles(videoId);
+            if (transcript != null && !transcript.isBlank()) {
+                return transcript;
             }
 
-            // Try 2: Find any auto-generated transcript and translate to English
-            if (content == null) {
-                try {
-                    var generated = transcriptList.findGeneratedTranscript("en", "en-US", "en-GB");
-                    content = generated.fetch();
-                    log.info("Found auto-generated English transcript for video {}", videoId);
-                } catch (Exception e) {
-                    log.debug("No auto-generated English transcript for {}, trying other languages...", videoId);
-                }
+            // Strategy 2: Java transcript API library (no cookies, works on non-blocked IPs)
+            transcript = fetchViaTranscriptApi(videoId);
+            if (transcript != null && !transcript.isBlank()) {
+                return transcript;
             }
 
-            // Try 3: Get any available transcript and translate to English
-            if (content == null) {
-                try {
-                    var anyTranscript = transcriptList.iterator().next();
-                    if (anyTranscript.isTranslatable()) {
-                        content = anyTranscript.translate("en").fetch();
-                        log.info("Translated transcript from {} to English for video {}",
-                                anyTranscript.getLanguage(), videoId);
-                    } else {
-                        content = anyTranscript.fetch();
-                        log.info("Using non-English transcript ({}) for video {}",
-                                anyTranscript.getLanguage(), videoId);
-                    }
-                } catch (Exception e) {
-                    log.warn("No transcript available at all for video {}: {}", videoId, e.getMessage());
-                    return null;
-                }
-            }
-
-            if (content == null || content.getContent().isEmpty()) {
-                log.warn("Transcript content is empty for video {}", videoId);
-                return null;
-            }
-
-            // Join all transcript fragments into a single text
-            String fullText = content.getContent().stream()
-                    .map(fragment -> fragment.getText())
-                    .collect(Collectors.joining(" "));
-
-            // Clean up common transcript artifacts
-            fullText = fullText
-                    .replaceAll("\\[Music\\]", "")
-                    .replaceAll("\\[Applause\\]", "")
-                    .replaceAll("\\s+", " ")
-                    .trim();
-
-            if (fullText.isBlank()) {
-                log.warn("Transcript text is blank after cleanup for video {}", videoId);
-                return null;
-            }
-
-            log.info("YouTube transcript fetched: {} characters for video {}", fullText.length(), videoId);
-            log.debug("Transcript preview: {}", fullText.substring(0, Math.min(200, fullText.length())));
-            return fullText;
+            log.warn("All transcript methods failed for video {}", videoId);
+            return null;
 
         }).subscribeOn(Schedulers.boundedElastic());
     }
 
     /**
-     * Parses a Netscape-format cookies.txt file into a CookieManager.
+     * Uses yt-dlp to extract subtitles WITHOUT downloading the video.
+     * This leverages yt-dlp's battle-tested cookie handling.
      */
-    private CookieManager parseCookiesTxt(Path cookiesFile) throws IOException {
-        CookieManager cookieManager = new CookieManager();
-        for (String line : Files.readAllLines(cookiesFile)) {
-            line = line.trim();
-            if (line.isEmpty() || line.startsWith("#")) continue;
+    private String fetchViaYtDlpSubtitles(String videoId) {
+        try {
+            Path tempPath = Paths.get(tempDir);
+            Files.createDirectories(tempPath);
 
-            String[] parts = line.split("\t");
-            if (parts.length < 7) continue;
+            String filename = "subs-" + UUID.randomUUID().toString();
+            Path outputTemplate = tempPath.resolve(filename);
 
-            String domain = parts[0];
-            String path = parts[2];
-            boolean secure = "TRUE".equalsIgnoreCase(parts[3]);
-            String name = parts[5];
-            String value = parts[6];
+            List<String> command = new ArrayList<>(List.of(
+                    "yt-dlp",
+                    "--write-subs",              // Download subtitles
+                    "--write-auto-subs",          // Include auto-generated subs
+                    "--sub-langs", "en.*,-live_chat",  // English variants, exclude live chat
+                    "--skip-download",            // Don't download the video
+                    "--convert-subs", "srt",      // Convert to SRT format
+                    "--no-playlist",
+                    "--no-warnings"
+            ));
 
-            HttpCookie cookie = new HttpCookie(name, value);
-            cookie.setDomain(domain.startsWith(".") ? domain : "." + domain);
-            cookie.setPath(path);
-            cookie.setSecure(secure);
-            cookie.setVersion(0);
+            // Add cookies for authentication
+            if (cookiesPath != null && !cookiesPath.isBlank() && Files.exists(Paths.get(cookiesPath))) {
+                command.add("--cookies");
+                command.add(cookiesPath);
+            }
 
-            String scheme = secure ? "https" : "http";
-            String cleanDomain = domain.startsWith(".") ? domain.substring(1) : domain;
-            URI uri = URI.create(scheme + "://" + cleanDomain + path);
-            cookieManager.getCookieStore().add(uri, cookie);
+            command.add("-o");
+            command.add(outputTemplate.toString());
+            command.add("https://www.youtube.com/watch?v=" + videoId);
+
+            log.debug("Executing yt-dlp subtitle command: {}", String.join(" ", command));
+
+            ProcessBuilder pb = new ProcessBuilder(command);
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+
+            String output;
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                output = reader.lines().collect(Collectors.joining("\n"));
+            }
+
+            int exitCode = process.waitFor();
+
+            if (exitCode != 0) {
+                log.debug("yt-dlp subtitle extraction failed (exit {}): {}", exitCode, output);
+                return null;
+            }
+
+            // Find the generated .srt file
+            Path srtFile = Files.list(tempPath)
+                    .filter(p -> p.getFileName().toString().startsWith(filename))
+                    .filter(p -> p.toString().endsWith(".srt"))
+                    .findFirst()
+                    .orElse(null);
+
+            if (srtFile == null) {
+                log.debug("No SRT file produced by yt-dlp for video {}", videoId);
+                // Clean up any non-srt files that were created
+                cleanupSubFiles(tempPath, filename);
+                return null;
+            }
+
+            // Parse SRT to plain text
+            String srtContent = Files.readString(srtFile);
+            String text = parseSrtToText(srtContent);
+
+            // Clean up subtitle files
+            cleanupSubFiles(tempPath, filename);
+
+            if (text != null && !text.isBlank()) {
+                log.info("YouTube transcript via yt-dlp subtitles: {} chars for video {}", text.length(), videoId);
+                return text;
+            }
+
+            return null;
+        } catch (Exception e) {
+            log.debug("yt-dlp subtitle extraction error for {}: {}", videoId, e.getMessage());
+            return null;
         }
-        log.info("Parsed {} cookies from {}", cookieManager.getCookieStore().getCookies().size(), cookiesFile);
-        return cookieManager;
     }
 
     /**
-     * Custom YoutubeClient that uses an HttpClient with cookie support.
+     * Parses SRT content into plain text, removing timestamps, sequence numbers,
+     * and deduplicating repeated lines from auto-generated subtitles.
      */
-    private static class CookieYoutubeClient implements YoutubeClient {
-        private final HttpClient httpClient;
+    private String parseSrtToText(String srtContent) {
+        List<String> textLines = srtContent.lines()
+                .map(String::trim)
+                .filter(line -> !line.isEmpty())
+                .filter(line -> !SRT_INDEX.matcher(line).matches())
+                .filter(line -> !SRT_TIMESTAMP.matcher(line).matches())
+                .map(line -> line.replaceAll("<[^>]+>", ""))  // Remove HTML tags
+                .filter(line -> !line.isBlank())
+                .collect(Collectors.toList());
 
-        CookieYoutubeClient(HttpClient httpClient) {
-            this.httpClient = httpClient;
-        }
-
-        @Override
-        public String get(String url, Map<String, String> headers) throws TranscriptRetrievalException {
-            try {
-                HttpRequest.Builder builder = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .GET();
-                if (headers != null) {
-                    headers.forEach(builder::header);
-                }
-                HttpResponse<String> response = httpClient.send(builder.build(),
-                        HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() >= 400) {
-                    throw new TranscriptRetrievalException(url,
-                            "Request to YouTube failed. Status code: " + response.statusCode());
-                }
-                return response.body();
-            } catch (TranscriptRetrievalException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new TranscriptRetrievalException(url, "HTTP request failed: " + e.getMessage());
+        // Deduplicate: auto-generated subs repeat text across overlapping timestamps
+        List<String> deduped = new ArrayList<>();
+        String lastLine = "";
+        for (String line : textLines) {
+            if (!line.equals(lastLine)) {
+                deduped.add(line);
+                lastLine = line;
             }
         }
 
-        @Override
-        public String post(String url, String body) throws TranscriptRetrievalException {
+        return String.join(" ", deduped)
+                .replaceAll("\\[Music\\]", "")
+                .replaceAll("\\[Applause\\]", "")
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    /**
+     * Clean up temporary subtitle files.
+     */
+    private void cleanupSubFiles(Path tempPath, String filenamePrefix) {
+        try {
+            Files.list(tempPath)
+                    .filter(p -> p.getFileName().toString().startsWith(filenamePrefix))
+                    .forEach(p -> {
+                        try { Files.deleteIfExists(p); } catch (Exception ignored) {}
+                    });
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * Uses the Java youtube-transcript-api library (no cookies, fast).
+     * Works when YouTube isn't blocking the server IP.
+     */
+    private String fetchViaTranscriptApi(String videoId) {
+        try {
+            log.debug("Trying Java transcript API for video {}", videoId);
+            TranscriptList transcriptList = transcriptApiLib.listTranscripts(videoId);
+
+            TranscriptContent content = null;
+
+            // Try English transcript
             try {
-                HttpRequest request = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(body))
-                        .build();
-                HttpResponse<String> response = httpClient.send(request,
-                        HttpResponse.BodyHandlers.ofString());
-                if (response.statusCode() >= 400) {
-                    throw new TranscriptRetrievalException(url,
-                            "Request to YouTube failed. Status code: " + response.statusCode());
-                }
-                return response.body();
-            } catch (TranscriptRetrievalException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new TranscriptRetrievalException(url, "HTTP request failed: " + e.getMessage());
+                content = transcriptList.findTranscript("en", "en-US", "en-GB").fetch();
+            } catch (Exception ignored) {}
+
+            // Try auto-generated English
+            if (content == null) {
+                try {
+                    content = transcriptList.findGeneratedTranscript("en", "en-US", "en-GB").fetch();
+                } catch (Exception ignored) {}
             }
+
+            // Try any available transcript and translate
+            if (content == null) {
+                try {
+                    var anyTranscript = transcriptList.iterator().next();
+                    content = anyTranscript.isTranslatable()
+                            ? anyTranscript.translate("en").fetch()
+                            : anyTranscript.fetch();
+                } catch (Exception e) {
+                    log.debug("No transcript via API for {}: {}", videoId, e.getMessage());
+                    return null;
+                }
+            }
+
+            if (content == null || content.getContent().isEmpty()) return null;
+
+            String text = content.getContent().stream()
+                    .map(f -> f.getText())
+                    .collect(Collectors.joining(" "))
+                    .replaceAll("\\[Music\\]", "")
+                    .replaceAll("\\[Applause\\]", "")
+                    .replaceAll("\\s+", " ")
+                    .trim();
+
+            if (!text.isBlank()) {
+                log.info("YouTube transcript via API: {} chars for video {}", text.length(), videoId);
+            }
+            return text.isBlank() ? null : text;
+        } catch (Exception e) {
+            log.debug("Java transcript API failed for {}: {}", videoId, e.getMessage());
+            return null;
         }
     }
 }

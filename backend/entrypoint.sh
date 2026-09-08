@@ -11,16 +11,8 @@ if [ -n "$YTDLP_COOKIES_DATA" ]; then
     echo "$YTDLP_COOKIES_DATA" | base64 -d > "$COOKIES_FILE"
     chmod 600 "$COOKIES_FILE"
     echo "YouTube cookies restored successfully."
-fi
-
-# Restore OAuth2 token if set (legacy support)
-OAUTH2_TOKEN_DIR="/home/appuser/.cache/yt-dlp-youtube-oauth2"
-if [ -n "$YTDLP_OAUTH2_TOKEN_DATA" ]; then
-    echo "Restoring yt-dlp OAuth2 token from environment variable..."
-    mkdir -p "$OAUTH2_TOKEN_DIR"
-    echo "$YTDLP_OAUTH2_TOKEN_DATA" | base64 -d > "$OAUTH2_TOKEN_DIR/token.json"
-    chmod 600 "$OAUTH2_TOKEN_DIR/token.json"
-    echo "OAuth2 token restored successfully."
+else
+    echo "WARNING: No YTDLP_COOKIES_DATA env var set. YouTube may block requests."
 fi
 
 # Start the Java application

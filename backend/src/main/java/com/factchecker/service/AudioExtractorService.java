@@ -37,15 +37,6 @@ public class AudioExtractorService {
     @Value("${app.ytdlp.cookies-path:}")
     private String cookiesPath;
 
-    @Value("${app.ytdlp.po-token:}")
-    private String poToken;
-
-    @Value("${app.ytdlp.po-token-client:web}")
-    private String poTokenClient;
-
-    @Value("${app.ytdlp.oauth2-enabled:true}")
-    private boolean oauth2Enabled;
-
     /**
      * Downloads audio from the given URL and returns the path to the audio file.
      * Runs on a bounded elastic scheduler to avoid blocking the event loop.
@@ -72,29 +63,9 @@ public class AudioExtractorService {
                     "--max-filesize", "25m"         // Max 25MB (Groq limit)
             ));
 
-            // OAuth2 authentication - authenticates as a real Google user
-            // to bypass YouTube's datacenter IP blocks
-            if (oauth2Enabled) {
-                command.add("--username");
-                command.add("oauth2");
-                command.add("--password");
-                command.add("");
-            }
-
-            // Build extractor-args including PO Token if configured
-            String effectiveExtractorArgs = extractorArgs;
-            if (poToken != null && !poToken.isBlank()) {
-                String poArg = "youtube:po_token=" + poTokenClient + "+" + poToken;
-                if (effectiveExtractorArgs != null && !effectiveExtractorArgs.isBlank()) {
-                    effectiveExtractorArgs = effectiveExtractorArgs + ";" + poArg;
-                } else {
-                    effectiveExtractorArgs = poArg;
-                }
-            }
-
-            if (effectiveExtractorArgs != null && !effectiveExtractorArgs.isBlank()) {
+            if (extractorArgs != null && !extractorArgs.isBlank()) {
                 command.add("--extractor-args");
-                command.add(effectiveExtractorArgs);
+                command.add(extractorArgs);
             }
 
             if (userAgent != null && !userAgent.isBlank()) {

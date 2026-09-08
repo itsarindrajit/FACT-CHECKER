@@ -37,9 +37,6 @@ app:
     extractor-args: ${YTDLP_EXTRACTOR_ARGS:}
     user-agent: ${YTDLP_USER_AGENT:}
     cookies-path: ${YTDLP_COOKIES_PATH:/home/appuser/cookies.txt}
-    po-token: ${YTDLP_PO_TOKEN:}
-    po-token-client: ${YTDLP_PO_TOKEN_CLIENT:web}
-    oauth2-enabled: ${YTDLP_OAUTH2_ENABLED:false}
 
   rate-limit:
     requests-per-minute: 5
