@@ -29,7 +29,7 @@ export default function Hero() {
         transition={{ duration: 0.6, delay: 0.2 }}
         className="text-lg text-[var(--color-text-secondary)] max-w-xl mx-auto leading-relaxed"
       >
-        Paste a YouTube Short or Instagram Reel URL and get an instant,
+        Paste a YouTube Short, Instagram Reel, or Facebook Reel URL and get an instant,
         AI-generated fact-check report with verified sources.
       </motion.p>
     </div>

@@ -7,6 +7,7 @@ export default function UrlInput({ onSubmit, isLoading }) {
 
   const ytRegex = /(?:youtube\.com\/(?:shorts\/|watch\?v=)|youtu\.be\/)/;
   const instaRegex = /instagram\.com\/(?:reel|reels)\//;
+  const fbRegex = /(?:facebook\.com|fb\.com)\/(?:reel|reels|watch|video)|\/fb\.watch\//;
 
   const handlePaste = (e) => {
     const pasted = e.clipboardData.getData('text');
@@ -27,7 +28,11 @@ export default function UrlInput({ onSubmit, isLoading }) {
       setValidationMsg('✓ Instagram Reel detected');
       return true;
     }
-    setValidationMsg('⚠ Please enter a valid YouTube Shorts or Instagram Reels URL');
+    if (fbRegex.test(value)) {
+      setValidationMsg('✓ Facebook Reel detected');
+      return true;
+    }
+    setValidationMsg('⚠ Please enter a valid YouTube, Instagram, or Facebook URL');
     return false;
   };
 
@@ -39,14 +44,14 @@ export default function UrlInput({ onSubmit, isLoading }) {
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!url.trim() || isLoading) return;
-    if (!ytRegex.test(url) && !instaRegex.test(url)) {
-      setValidationMsg('⚠ Please enter a valid YouTube Shorts or Instagram Reels URL');
+    if (!ytRegex.test(url) && !instaRegex.test(url) && !fbRegex.test(url)) {
+      setValidationMsg('⚠ Please enter a valid YouTube, Instagram, or Facebook URL');
       return;
     }
     onSubmit(url.trim());
   };
 
-  const isValid = ytRegex.test(url) || instaRegex.test(url);
+  const isValid = ytRegex.test(url) || instaRegex.test(url) || fbRegex.test(url);
 
   return (
     <motion.form
@@ -73,7 +78,7 @@ export default function UrlInput({ onSubmit, isLoading }) {
             value={url}
             onChange={handleChange}
             onPaste={handlePaste}
-            placeholder="Paste a YouTube Short or Instagram Reel URL..."
+            placeholder="Paste a YouTube, Instagram, or Facebook Reel URL..."
             disabled={isLoading}
             className="w-full flex-1 bg-transparent px-5 py-3.5 text-[var(--color-text-primary)] placeholder:text-[var(--color-text-secondary)] outline-none text-base font-medium"
             autoComplete="off"
