@@ -140,8 +140,7 @@ public class YouTubeTranscriptService {
                     "--no-playlist",
                     "--no-warnings",
                     "--socket-timeout", "30",     // 30s network timeout per request
-                    "--retries", "2",             // Only retry twice (prevent infinite retry loops)
-                    "--extractor-args", "youtube:player_client=web"  // Use web client to bypass SABR issues
+                    "--retries", "2"              // Only retry twice (prevent infinite retry loops)
             ));
 
             // Add cookies for authentication
