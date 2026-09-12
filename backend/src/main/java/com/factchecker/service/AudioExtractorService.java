@@ -66,7 +66,8 @@ public class AudioExtractorService {
                     "--no-warnings",                // Suppress warnings
                     "--max-filesize", "25m",         // Max 25MB (Groq limit)
                     "--socket-timeout", "30",       // 30s network timeout per request
-                    "--retries", "2"                // Only retry twice (prevent infinite retry loops)
+                    "--retries", "2",               // Only retry twice (prevent infinite retry loops)
+                    "--extractor-args", "youtube:player_client=web"  // Use web client to bypass SABR issues
             ));
 
             if (extractorArgs != null && !extractorArgs.isBlank()) {

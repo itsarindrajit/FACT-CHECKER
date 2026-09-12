@@ -4,6 +4,7 @@ import io.github.thoroldvix.api.TranscriptApiFactory;
 import io.github.thoroldvix.api.TranscriptContent;
 import io.github.thoroldvix.api.TranscriptList;
 import io.github.thoroldvix.api.YoutubeTranscriptApi;
+import com.factchecker.exception.FactCheckException;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -29,7 +30,7 @@ import java.util.stream.Collectors;
  * Strategy (in order):
  * 1. yt-dlp subtitle extraction (--write-subs --skip-download) with cookies — most reliable on Render
  * 2. Java youtube-transcript-api library — fast fallback for non-blocked IPs
- * 3. Returns null → orchestrator falls back to full audio download + Groq
+ * 3. Throws FactCheckException → orchestrator falls back to full audio download + Groq
  */
 @Slf4j
 @Service
@@ -88,7 +89,7 @@ public class YouTubeTranscriptService {
 
     /**
      * Attempts to fetch the transcript for a YouTube video.
-     * Returns null if no transcript can be obtained.
+     * Throws FactCheckException if no transcript can be obtained (never returns null/empty Mono).
      */
     public Mono<String> fetchTranscript(String videoId) {
         return Mono.fromCallable(() -> {
@@ -106,8 +107,13 @@ public class YouTubeTranscriptService {
                 return transcript;
             }
 
+            // CRITICAL: Do NOT return null here. Mono.fromCallable(null) produces an empty Mono,
+            // which causes the downstream flatMap to never fire, leaving the SSE stream hanging forever.
             log.warn("All transcript methods failed for video {}", videoId);
-            return null;
+            throw new FactCheckException(
+                    "Could not get transcript for this YouTube video. " +
+                    "YouTube may be blocking requests from this server. " +
+                    "The video may be private, age-restricted, or region-locked.");
 
         }).subscribeOn(Schedulers.boundedElastic());
     }
@@ -134,7 +140,8 @@ public class YouTubeTranscriptService {
                     "--no-playlist",
                     "--no-warnings",
                     "--socket-timeout", "30",     // 30s network timeout per request
-                    "--retries", "2"              // Only retry twice (prevent infinite retry loops)
+                    "--retries", "2",             // Only retry twice (prevent infinite retry loops)
+                    "--extractor-args", "youtube:player_client=web"  // Use web client to bypass SABR issues
             ));
 
             // Add cookies for authentication

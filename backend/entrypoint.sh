@@ -3,17 +3,35 @@ set -e
 
 COOKIES_FILE="/home/appuser/cookies.txt"
 
-# Restore YouTube cookies from environment variable if set.
-# On Render (ephemeral containers), files are lost on every deploy.
-# We persist cookies as a base64-encoded env var and restore at startup.
-if [ -n "$YTDLP_COOKIES_DATA" ]; then
-    echo "Restoring YouTube cookies from environment variable..."
+# --- Cookie Restoration ---
+# Supports two methods (in order of priority):
+#
+# 1. DIRECT FILE: Render "Secret Files" feature — upload cookies.txt directly
+#    at /etc/secrets/cookies.txt (no base64 needed). Set YTDLP_COOKIES_PATH
+#    env var to this path, or it will be auto-detected.
+#
+# 2. BASE64 ENV VAR: Traditional approach — base64-encode cookies.txt and store
+#    as YTDLP_COOKIES_DATA env var. Decoded and written at startup.
+
+# Method 1: Check for directly uploaded cookie file (Render Secret Files)
+DIRECT_COOKIE_PATH="${YTDLP_COOKIES_SECRET_PATH:-/etc/secrets/cookies.txt}"
+if [ -f "$DIRECT_COOKIE_PATH" ] && [ -s "$DIRECT_COOKIE_PATH" ]; then
+    echo "Found direct cookie file at $DIRECT_COOKIE_PATH. Copying to $COOKIES_FILE..."
+    cp "$DIRECT_COOKIE_PATH" "$COOKIES_FILE"
+
+# Method 2: Restore from base64-encoded environment variable
+elif [ -n "$YTDLP_COOKIES_DATA" ]; then
+    echo "Restoring YouTube cookies from YTDLP_COOKIES_DATA environment variable..."
     echo "$YTDLP_COOKIES_DATA" | base64 -d > "$COOKIES_FILE"
 
-    # --- Sanitize the cookie file ---
-    # PowerShell on Windows can introduce BOM bytes and \r\n line endings
-    # which silently corrupt the Netscape cookie format that yt-dlp expects.
+else
+    echo "WARNING: No cookie source found. YouTube will likely block requests."
+    echo "  Option A: Upload cookies.txt via Render Secret Files at $DIRECT_COOKIE_PATH"
+    echo "  Option B: Set YTDLP_COOKIES_DATA env var with base64-encoded cookies"
+fi
 
+# --- Sanitize the cookie file (if it exists) ---
+if [ -f "$COOKIES_FILE" ] && [ -s "$COOKIES_FILE" ]; then
     # Strip UTF-8 BOM (EF BB BF) if present
     sed -i '1s/^\xEF\xBB\xBF//' "$COOKIES_FILE"
 
@@ -36,8 +54,6 @@ if [ -n "$YTDLP_COOKIES_DATA" ]; then
 
     echo "Cookie file stats: ${COOKIE_LINES} lines, ${COOKIE_SIZE} bytes"
 
-    # Netscape cookie files should start with "# Netscape HTTP Cookie File" or "# HTTP Cookie File"
-    # or the first data line should be a tab-separated domain entry starting with . or a domain
     if echo "$FIRST_LINE" | grep -qi "cookie"; then
         echo "Cookie file validated: Netscape header found."
     elif echo "$FIRST_LINE" | grep -qP '^\S+\t'; then
@@ -48,8 +64,6 @@ if [ -n "$YTDLP_COOKIES_DATA" ]; then
     fi
 
     echo "YouTube cookies restored and sanitized successfully."
-else
-    echo "WARNING: No YTDLP_COOKIES_DATA env var set. YouTube may block requests."
 fi
 
 # Update yt-dlp to latest version on every startup.
