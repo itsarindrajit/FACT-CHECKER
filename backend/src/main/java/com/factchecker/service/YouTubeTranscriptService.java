@@ -4,6 +4,7 @@ import io.github.thoroldvix.api.TranscriptApiFactory;
 import io.github.thoroldvix.api.TranscriptContent;
 import io.github.thoroldvix.api.TranscriptList;
 import io.github.thoroldvix.api.YoutubeTranscriptApi;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -18,6 +19,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -39,12 +41,50 @@ public class YouTubeTranscriptService {
     @Value("${app.temp-dir}")
     private String tempDir;
 
+    /** Timeout for yt-dlp subtitle extraction process (seconds). */
+    private static final int SUBTITLE_PROCESS_TIMEOUT_SECONDS = 60;
+
     private final YoutubeTranscriptApi transcriptApiLib = TranscriptApiFactory.createDefault();
 
     // Pattern to match SRT timestamps like "00:00:01,234 --> 00:00:03,456"
     private static final Pattern SRT_TIMESTAMP = Pattern.compile("\\d{2}:\\d{2}:\\d{2}[,.]\\d{3}\\s*-->\\s*\\d{2}:\\d{2}:\\d{2}[,.]\\d{3}");
     // Pattern to match SRT sequence numbers (just digits on a line)
     private static final Pattern SRT_INDEX = Pattern.compile("^\\d+$");
+
+    /**
+     * Validates the cookie file on startup and logs diagnostic information.
+     * This helps debug cookie-related authentication failures from the logs.
+     */
+    @PostConstruct
+    public void validateCookiesOnStartup() {
+        if (cookiesPath == null || cookiesPath.isBlank()) {
+            log.warn("No cookies path configured (app.ytdlp.cookies-path). YouTube will likely block requests.");
+            return;
+        }
+
+        Path path = Paths.get(cookiesPath);
+        if (!Files.exists(path)) {
+            log.warn("Cookie file does not exist: {}. It may be restored at runtime by entrypoint.sh.", cookiesPath);
+            return;
+        }
+
+        try {
+            long size = Files.size(path);
+            long lineCount = Files.lines(path).count();
+            String firstLine = Files.lines(path).findFirst().orElse("(empty)");
+
+            log.info("Cookie file validated: {} lines, {} bytes, path: {}", lineCount, size, cookiesPath);
+
+            if (firstLine.toLowerCase().contains("cookie")) {
+                log.info("Cookie file has valid Netscape header.");
+            } else {
+                log.warn("Cookie file first line does not look like Netscape format: '{}'",
+                        firstLine.length() > 80 ? firstLine.substring(0, 80) + "..." : firstLine);
+            }
+        } catch (Exception e) {
+            log.warn("Could not validate cookie file {}: {}", cookiesPath, e.getMessage());
+        }
+    }
 
     /**
      * Attempts to fetch the transcript for a YouTube video.
@@ -92,7 +132,9 @@ public class YouTubeTranscriptService {
                     "--skip-download",            // Don't download the video
                     "--convert-subs", "srt",      // Convert to SRT format
                     "--no-playlist",
-                    "--no-warnings"
+                    "--no-warnings",
+                    "--socket-timeout", "30",     // 30s network timeout per request
+                    "--retries", "2"              // Only retry twice (prevent infinite retry loops)
             ));
 
             // Add cookies for authentication
@@ -116,7 +158,18 @@ public class YouTubeTranscriptService {
                 output = reader.lines().collect(Collectors.joining("\n"));
             }
 
-            int exitCode = process.waitFor();
+            boolean completed = process.waitFor(SUBTITLE_PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+            if (!completed) {
+                log.error("yt-dlp subtitle extraction TIMED OUT after {}s for video {}. Force-killing process.",
+                        SUBTITLE_PROCESS_TIMEOUT_SECONDS, videoId);
+                process.destroyForcibly();
+                process.waitFor(5, TimeUnit.SECONDS); // Give it a moment to die
+                cleanupSubFiles(tempPath, filename);
+                return null;
+            }
+
+            int exitCode = process.exitValue();
 
             if (exitCode != 0) {
                 log.debug("yt-dlp subtitle extraction failed (exit {}): {}", exitCode, output);

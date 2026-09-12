@@ -15,6 +15,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -36,6 +37,9 @@ public class AudioExtractorService {
 
     @Value("${app.ytdlp.cookies-path:}")
     private String cookiesPath;
+
+    /** Timeout for yt-dlp audio download process (seconds). */
+    private static final int AUDIO_PROCESS_TIMEOUT_SECONDS = 120;
 
     /**
      * Downloads audio from the given URL and returns the path to the audio file.
@@ -60,7 +64,9 @@ public class AudioExtractorService {
                     "--audio-quality", "5",         // Medium quality (saves bandwidth)
                     "--no-playlist",                // Don't download playlists
                     "--no-warnings",                // Suppress warnings
-                    "--max-filesize", "25m"         // Max 25MB (Groq limit)
+                    "--max-filesize", "25m",         // Max 25MB (Groq limit)
+                    "--socket-timeout", "30",       // 30s network timeout per request
+                    "--retries", "2"                // Only retry twice (prevent infinite retry loops)
             ));
 
             if (extractorArgs != null && !extractorArgs.isBlank()) {
@@ -96,7 +102,19 @@ public class AudioExtractorService {
                 processOutput = reader.lines().collect(Collectors.joining("\n"));
             }
 
-            int exitCode = process.waitFor();
+            boolean completed = process.waitFor(AUDIO_PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+            if (!completed) {
+                log.error("yt-dlp audio extraction TIMED OUT after {}s for URL: {}. Force-killing process.",
+                        AUDIO_PROCESS_TIMEOUT_SECONDS, url);
+                process.destroyForcibly();
+                process.waitFor(5, TimeUnit.SECONDS); // Give it a moment to die
+                throw new FactCheckException(
+                        "Audio download timed out after " + AUDIO_PROCESS_TIMEOUT_SECONDS +
+                        " seconds. The video may be unavailable or the server is being rate-limited.");
+            }
+
+            int exitCode = process.exitValue();
 
             if (exitCode != 0) {
                 log.error("yt-dlp failed with exit code {}: {}", exitCode, processOutput);
