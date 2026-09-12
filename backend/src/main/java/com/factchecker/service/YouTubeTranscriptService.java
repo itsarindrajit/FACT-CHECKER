@@ -140,7 +140,10 @@ public class YouTubeTranscriptService {
                     "--no-playlist",
                     "--no-warnings",
                     "--socket-timeout", "30",     // 30s network timeout per request
-                    "--retries", "2"              // Only retry twice (prevent infinite retry loops)
+                    "--retries", "2",             // Only retry twice (prevent infinite retry loops)
+                    // iOS client bypasses YouTube's SABR protection ("page needs to be reloaded")
+                    // AND provides actual formats (unlike web client which had none)
+                    "--extractor-args", "youtube:player_client=ios"
             ));
 
             // Add cookies for authentication
