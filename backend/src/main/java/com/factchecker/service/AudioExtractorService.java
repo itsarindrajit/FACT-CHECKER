@@ -67,9 +67,9 @@ public class AudioExtractorService {
                     "--max-filesize", "25m",         // Max 25MB (Groq limit)
                     "--socket-timeout", "30",       // 30s network timeout per request
                     "--retries", "2",               // Only retry twice (prevent infinite retry loops)
-                    // iOS client bypasses YouTube's SABR protection ("page needs to be reloaded")
-                    // AND provides actual formats (unlike web client which had none)
-                    "--extractor-args", "youtube:player_client=ios"
+                    // Try multiple player clients — yt-dlp merges format lists from all of them.
+                    // Maximizes chances of finding a downloadable format on datacenter IPs.
+                    "--extractor-args", "youtube:player_client=ios,mweb,tv_embedded"
             ));
 
             if (extractorArgs != null && !extractorArgs.isBlank()) {

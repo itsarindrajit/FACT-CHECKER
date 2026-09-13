@@ -139,10 +139,11 @@ public class YouTubeTranscriptService {
                     "--convert-subs", "srt",      // Convert to SRT format
                     "--no-playlist",
                     "--no-warnings",
+                    "--ignore-errors",            // Continue past format errors — we only need subtitles, not formats
                     "--socket-timeout", "30",     // 30s network timeout per request
                     "--retries", "2",             // Only retry twice (prevent infinite retry loops)
-                    // iOS client bypasses YouTube's SABR protection ("page needs to be reloaded")
-                    // AND provides actual formats (unlike web client which had none)
+                    // iOS client bypasses SABR ("page needs to be reloaded").
+                    // It may report "format not available" but --ignore-errors lets subtitle download proceed anyway.
                     "--extractor-args", "youtube:player_client=ios"
             ));
 
@@ -181,11 +182,13 @@ public class YouTubeTranscriptService {
             int exitCode = process.exitValue();
 
             if (exitCode != 0) {
-                log.debug("yt-dlp subtitle extraction failed (exit {}): {}", exitCode, output);
-                return null;
+                // With --ignore-errors, yt-dlp may still write subtitle files even with a non-zero exit code.
+                // Don't bail out — check for SRT files below.
+                log.debug("yt-dlp subtitle extraction reported errors (exit {}): {}", exitCode, output);
             }
 
-            // Find the generated .srt file
+            // Find the generated .srt file — check regardless of exit code since
+            // --ignore-errors lets subtitle download proceed past format errors
             Path srtFile = Files.list(tempPath)
                     .filter(p -> p.getFileName().toString().startsWith(filename))
                     .filter(p -> p.toString().endsWith(".srt"))
