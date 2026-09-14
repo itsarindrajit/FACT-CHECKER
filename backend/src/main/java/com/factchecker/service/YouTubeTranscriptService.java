@@ -1,10 +1,12 @@
 package com.factchecker.service;
 
+import com.factchecker.exception.FactCheckException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.thoroldvix.api.TranscriptApiFactory;
 import io.github.thoroldvix.api.TranscriptContent;
 import io.github.thoroldvix.api.TranscriptList;
 import io.github.thoroldvix.api.YoutubeTranscriptApi;
-import com.factchecker.exception.FactCheckException;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,25 +14,27 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
  * Fetches YouTube video transcripts/subtitles without downloading the video.
  *
  * Strategy (in order):
- * 1. yt-dlp subtitle extraction (--write-subs --skip-download) with cookies — most reliable on Render
- * 2. Java youtube-transcript-api library — fast fallback for non-blocked IPs
- * 3. Throws FactCheckException → orchestrator falls back to full audio download + Groq
+ * 1. Direct HTTP fetch — downloads the YouTube page with cookies, extracts caption data
+ *    from the embedded ytInitialPlayerResponse JSON. Bypasses yt-dlp entirely, avoiding
+ *    all player client / format selection issues on datacenter IPs.
+ * 2. Java youtube-transcript-api library — fast fallback for non-blocked IPs (no cookies).
+ * 3. Throws FactCheckException → orchestrator falls back to full audio download + Groq.
  */
 @Slf4j
 @Service
@@ -42,19 +46,15 @@ public class YouTubeTranscriptService {
     @Value("${app.temp-dir}")
     private String tempDir;
 
-    /** Timeout for yt-dlp subtitle extraction process (seconds). */
-    private static final int SUBTITLE_PROCESS_TIMEOUT_SECONDS = 60;
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    private static final String USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
     private final YoutubeTranscriptApi transcriptApiLib = TranscriptApiFactory.createDefault();
 
-    // Pattern to match SRT timestamps like "00:00:01,234 --> 00:00:03,456"
-    private static final Pattern SRT_TIMESTAMP = Pattern.compile("\\d{2}:\\d{2}:\\d{2}[,.]\\d{3}\\s*-->\\s*\\d{2}:\\d{2}:\\d{2}[,.]\\d{3}");
-    // Pattern to match SRT sequence numbers (just digits on a line)
-    private static final Pattern SRT_INDEX = Pattern.compile("^\\d+$");
-
     /**
      * Validates the cookie file on startup and logs diagnostic information.
-     * This helps debug cookie-related authentication failures from the logs.
      */
     @PostConstruct
     public void validateCookiesOnStartup() {
@@ -95,8 +95,9 @@ public class YouTubeTranscriptService {
         return Mono.fromCallable(() -> {
             log.info("Fetching YouTube transcript for video ID: {}", videoId);
 
-            // Strategy 1: yt-dlp subtitle extraction with cookies (most reliable on Render)
-            String transcript = fetchViaYtDlpSubtitles(videoId);
+            // Strategy 1: Direct HTTP fetch — bypasses yt-dlp and its player client issues entirely.
+            // Downloads the YouTube page with cookies, extracts caption data from the page HTML.
+            String transcript = fetchViaDirectHttp(videoId);
             if (transcript != null && !transcript.isBlank()) {
                 return transcript;
             }
@@ -118,152 +119,284 @@ public class YouTubeTranscriptService {
         }).subscribeOn(Schedulers.boundedElastic());
     }
 
+    // ========================================================================
+    // Strategy 1: Direct HTTP — fetch page with cookies, parse captions from HTML
+    // ========================================================================
+
     /**
-     * Uses yt-dlp to extract subtitles WITHOUT downloading the video.
-     * This leverages yt-dlp's battle-tested cookie handling.
+     * Fetches subtitles directly via HTTP with cookie authentication.
+     * This completely bypasses yt-dlp, avoiding all player client / format selection
+     * issues that plague datacenter IPs.
+     *
+     * How it works:
+     * 1. Load cookies from the Netscape cookie file
+     * 2. GET the YouTube page with cookies (this always succeeds with valid cookies)
+     * 3. Extract the ytInitialPlayerResponse JSON embedded in the page HTML
+     * 4. Parse caption track URLs from the JSON
+     * 5. Download the actual caption content
+     * 6. Parse and return plain text
      */
-    private String fetchViaYtDlpSubtitles(String videoId) {
+    private String fetchViaDirectHttp(String videoId) {
         try {
-            Path tempPath = Paths.get(tempDir);
-            Files.createDirectories(tempPath);
+            log.debug("Trying direct HTTP subtitle fetch for video {}", videoId);
 
-            String filename = "subs-" + UUID.randomUUID().toString();
-            Path outputTemplate = tempPath.resolve(filename);
-
-            List<String> command = new ArrayList<>(List.of(
-                    "yt-dlp",
-                    "--write-subs",              // Download subtitles
-                    "--write-auto-subs",          // Include auto-generated subs
-                    "--sub-langs", "en.*,-live_chat",  // English variants, exclude live chat
-                    "--skip-download",            // Don't download the video
-                    "--convert-subs", "srt",      // Convert to SRT format
-                    "--no-playlist",
-                    "--no-warnings",
-                    "--ignore-errors",            // Continue past format errors — we only need subtitles, not formats
-                    "--socket-timeout", "30",     // 30s network timeout per request
-                    "--retries", "2",             // Only retry twice (prevent infinite retry loops)
-                    // iOS client bypasses SABR ("page needs to be reloaded").
-                    // It may report "format not available" but --ignore-errors lets subtitle download proceed anyway.
-                    "--extractor-args", "youtube:player_client=ios"
-            ));
-
-            // Add cookies for authentication
-            if (cookiesPath != null && !cookiesPath.isBlank() && Files.exists(Paths.get(cookiesPath))) {
-                command.add("--cookies");
-                command.add(cookiesPath);
-            }
-
-            command.add("-o");
-            command.add(outputTemplate.toString());
-            command.add("https://www.youtube.com/watch?v=" + videoId);
-
-            log.debug("Executing yt-dlp subtitle command: {}", String.join(" ", command));
-
-            ProcessBuilder pb = new ProcessBuilder(command);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            String output;
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                output = reader.lines().collect(Collectors.joining("\n"));
-            }
-
-            boolean completed = process.waitFor(SUBTITLE_PROCESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-
-            if (!completed) {
-                log.error("yt-dlp subtitle extraction TIMED OUT after {}s for video {}. Force-killing process.",
-                        SUBTITLE_PROCESS_TIMEOUT_SECONDS, videoId);
-                process.destroyForcibly();
-                process.waitFor(5, TimeUnit.SECONDS); // Give it a moment to die
-                cleanupSubFiles(tempPath, filename);
+            // Step 1: Build cookie header from Netscape cookie file
+            String cookieHeader = buildCookieHeader();
+            if (cookieHeader == null || cookieHeader.isBlank()) {
+                log.debug("No cookies available for direct HTTP fetch");
                 return null;
             }
 
-            int exitCode = process.exitValue();
+            HttpClient client = HttpClient.newBuilder()
+                    .followRedirects(HttpClient.Redirect.NORMAL)
+                    .connectTimeout(Duration.ofSeconds(15))
+                    .build();
 
-            if (exitCode != 0) {
-                // With --ignore-errors, yt-dlp may still write subtitle files even with a non-zero exit code.
-                // Don't bail out — check for SRT files below.
-                log.debug("yt-dlp subtitle extraction reported errors (exit {}): {}", exitCode, output);
-            }
+            // Step 2: Fetch the YouTube page with cookies
+            HttpRequest pageRequest = HttpRequest.newBuilder()
+                    .uri(URI.create("https://www.youtube.com/watch?v=" + videoId))
+                    .header("Cookie", cookieHeader)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .timeout(Duration.ofSeconds(30))
+                    .GET()
+                    .build();
 
-            // Find the generated .srt file — check regardless of exit code since
-            // --ignore-errors lets subtitle download proceed past format errors
-            Path srtFile = Files.list(tempPath)
-                    .filter(p -> p.getFileName().toString().startsWith(filename))
-                    .filter(p -> p.toString().endsWith(".srt"))
-                    .findFirst()
-                    .orElse(null);
+            HttpResponse<String> pageResponse = client.send(pageRequest, HttpResponse.BodyHandlers.ofString());
 
-            if (srtFile == null) {
-                log.debug("No SRT file produced by yt-dlp for video {}", videoId);
-                // Clean up any non-srt files that were created
-                cleanupSubFiles(tempPath, filename);
+            if (pageResponse.statusCode() != 200) {
+                log.debug("YouTube page returned status {} for video {}", pageResponse.statusCode(), videoId);
                 return null;
             }
 
-            // Parse SRT to plain text
-            String srtContent = Files.readString(srtFile);
-            String text = parseSrtToText(srtContent);
+            String html = pageResponse.body();
+            log.debug("YouTube page fetched: {} chars for video {}", html.length(), videoId);
 
-            // Clean up subtitle files
-            cleanupSubFiles(tempPath, filename);
+            // Step 3: Extract ytInitialPlayerResponse JSON from HTML
+            String playerResponseJson = extractJsonFromHtml(html, "ytInitialPlayerResponse");
+            if (playerResponseJson == null) {
+                log.debug("Could not find ytInitialPlayerResponse in page for video {}", videoId);
+                return null;
+            }
+
+            // Step 4: Parse caption tracks from the JSON
+            JsonNode playerResponse = objectMapper.readTree(playerResponseJson);
+            JsonNode captionTracks = playerResponse
+                    .path("captions")
+                    .path("playerCaptionsTracklistRenderer")
+                    .path("captionTracks");
+
+            if (captionTracks.isMissingNode() || !captionTracks.isArray() || captionTracks.isEmpty()) {
+                log.debug("No caption tracks found in playerResponse for video {}", videoId);
+                return null;
+            }
+
+            log.debug("Found {} caption tracks for video {}", captionTracks.size(), videoId);
+
+            // Step 5: Find the best English caption track
+            String captionUrl = findEnglishCaptionUrl(captionTracks);
+            if (captionUrl == null) {
+                log.debug("No suitable caption URL found for video {}", videoId);
+                return null;
+            }
+
+            // Request JSON3 format for easier parsing
+            String separator = captionUrl.contains("?") ? "&" : "?";
+            captionUrl = captionUrl + separator + "fmt=json3";
+
+            // Step 6: Download the caption content
+            HttpRequest captionRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(captionUrl))
+                    .header("Cookie", cookieHeader)
+                    .header("User-Agent", USER_AGENT)
+                    .timeout(Duration.ofSeconds(15))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> captionResponse = client.send(captionRequest, HttpResponse.BodyHandlers.ofString());
+
+            if (captionResponse.statusCode() != 200) {
+                log.debug("Caption download returned status {} for video {}", captionResponse.statusCode(), videoId);
+                return null;
+            }
+
+            // Step 7: Parse the caption JSON3 format to plain text
+            String text = parseCaptionJson3(captionResponse.body());
 
             if (text != null && !text.isBlank()) {
-                log.info("YouTube transcript via yt-dlp subtitles: {} chars for video {}", text.length(), videoId);
+                log.info("YouTube transcript via direct HTTP: {} chars for video {}", text.length(), videoId);
                 return text;
             }
 
             return null;
         } catch (Exception e) {
-            log.debug("yt-dlp subtitle extraction error for {}: {}", videoId, e.getMessage());
+            log.debug("Direct HTTP subtitle fetch error for {}: {}", videoId, e.getMessage());
             return null;
         }
     }
 
     /**
-     * Parses SRT content into plain text, removing timestamps, sequence numbers,
-     * and deduplicating repeated lines from auto-generated subtitles.
+     * Extracts a JSON object assigned to a variable name from YouTube page HTML.
+     * Uses brace-counting to correctly handle nested JSON.
      */
-    private String parseSrtToText(String srtContent) {
-        List<String> textLines = srtContent.lines()
-                .map(String::trim)
-                .filter(line -> !line.isEmpty())
-                .filter(line -> !SRT_INDEX.matcher(line).matches())
-                .filter(line -> !SRT_TIMESTAMP.matcher(line).matches())
-                .map(line -> line.replaceAll("<[^>]+>", ""))  // Remove HTML tags
-                .filter(line -> !line.isBlank())
-                .collect(Collectors.toList());
+    private String extractJsonFromHtml(String html, String variableName) {
+        // Try patterns: "var NAME = {...};" and "NAME = {...};"
+        int startIdx = html.indexOf(variableName);
+        if (startIdx == -1) return null;
 
-        // Deduplicate: auto-generated subs repeat text across overlapping timestamps
-        List<String> deduped = new ArrayList<>();
-        String lastLine = "";
-        for (String line : textLines) {
-            if (!line.equals(lastLine)) {
-                deduped.add(line);
-                lastLine = line;
+        // Find the first '{' after the variable name
+        int jsonStart = html.indexOf('{', startIdx);
+        if (jsonStart == -1) return null;
+
+        // Use brace-counting to find the matching closing '}'
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+        int jsonEnd = -1;
+
+        for (int i = jsonStart; i < html.length(); i++) {
+            char c = html.charAt(i);
+
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
+
+            if (c == '"') {
+                inString = !inString;
+                continue;
+            }
+
+            if (inString) continue;
+
+            if (c == '{') depth++;
+            else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    jsonEnd = i + 1;
+                    break;
+                }
             }
         }
 
-        return String.join(" ", deduped)
-                .replaceAll("\\[Music\\]", "")
-                .replaceAll("\\[Applause\\]", "")
-                .replaceAll("\\s+", " ")
-                .trim();
+        if (jsonEnd == -1) return null;
+        return html.substring(jsonStart, jsonEnd);
     }
 
     /**
-     * Clean up temporary subtitle files.
+     * Finds the best English caption URL from a list of caption tracks.
+     * Prefers manual English captions, then auto-generated, then any language.
      */
-    private void cleanupSubFiles(Path tempPath, String filenamePrefix) {
-        try {
-            Files.list(tempPath)
-                    .filter(p -> p.getFileName().toString().startsWith(filenamePrefix))
-                    .forEach(p -> {
-                        try { Files.deleteIfExists(p); } catch (Exception ignored) {}
-                    });
-        } catch (Exception ignored) {}
+    private String findEnglishCaptionUrl(JsonNode captionTracks) {
+        String englishUrl = null;
+        String anyUrl = null;
+
+        for (JsonNode track : captionTracks) {
+            String langCode = track.path("languageCode").asText("");
+            String kind = track.path("kind").asText("");
+            String baseUrl = track.path("baseUrl").asText(null);
+
+            if (baseUrl == null) continue;
+
+            if (langCode.startsWith("en")) {
+                if (!"asr".equals(kind)) {
+                    // Prefer manual English captions (not auto-generated)
+                    return baseUrl;
+                }
+                if (englishUrl == null) {
+                    englishUrl = baseUrl;
+                }
+            }
+
+            if (anyUrl == null) {
+                anyUrl = baseUrl;
+            }
+        }
+
+        return englishUrl != null ? englishUrl : anyUrl;
     }
+
+    /**
+     * Parses YouTube's JSON3 caption format into plain text.
+     * JSON3 structure: { "events": [{ "segs": [{ "utf8": "text" }] }] }
+     */
+    private String parseCaptionJson3(String jsonContent) {
+        try {
+            JsonNode root = objectMapper.readTree(jsonContent);
+            JsonNode events = root.path("events");
+            if (events.isMissingNode() || !events.isArray()) return null;
+
+            StringBuilder text = new StringBuilder();
+            for (JsonNode event : events) {
+                JsonNode segs = event.path("segs");
+                if (segs.isArray()) {
+                    for (JsonNode seg : segs) {
+                        String segText = seg.path("utf8").asText("");
+                        if (!segText.isBlank() && !segText.equals("\n")) {
+                            text.append(segText).append(" ");
+                        }
+                    }
+                }
+            }
+
+            return text.toString()
+                    .replaceAll("\\[Music\\]", "")
+                    .replaceAll("\\[Applause\\]", "")
+                    .replaceAll("\\s+", " ")
+                    .trim();
+        } catch (Exception e) {
+            log.debug("Failed to parse caption JSON3: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Builds an HTTP Cookie header string from the Netscape cookie file.
+     * Only includes cookies for youtube.com and google.com domains.
+     */
+    private String buildCookieHeader() {
+        if (cookiesPath == null || cookiesPath.isBlank()) return null;
+
+        Path path = Paths.get(cookiesPath);
+        if (!Files.exists(path)) return null;
+
+        try {
+            List<String> cookies = new ArrayList<>();
+            for (String line : Files.readAllLines(path)) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+
+                String[] parts = line.split("\t");
+                if (parts.length >= 7) {
+                    String domain = parts[0];
+                    String name = parts[5];
+                    String value = parts[6];
+
+                    // Only include YouTube/Google cookies
+                    if (domain.contains("youtube.com") || domain.contains(".google.com")) {
+                        cookies.add(name + "=" + value);
+                    }
+                }
+            }
+
+            String header = String.join("; ", cookies);
+            log.debug("Built cookie header with {} cookies", cookies.size());
+            return header.isEmpty() ? null : header;
+        } catch (Exception e) {
+            log.debug("Failed to parse cookie file: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    // ========================================================================
+    // Strategy 2: Java youtube-transcript-api (no cookies, for non-blocked IPs)
+    // ========================================================================
 
     /**
      * Uses the Java youtube-transcript-api library (no cookies, fast).
