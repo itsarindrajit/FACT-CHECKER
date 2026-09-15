@@ -15,17 +15,17 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.net.URI;
-import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -33,8 +33,8 @@ import java.util.stream.Collectors;
  *
  * Strategy (in order):
  * 1. Direct HTTP fetch — downloads the YouTube page with cookies, extracts caption data
- *    from the embedded ytInitialPlayerResponse JSON. Bypasses yt-dlp entirely, avoiding
- *    all player client / format selection issues on datacenter IPs.
+ *    from the embedded ytInitialPlayerResponse JSON, then downloads subtitle content
+ *    using merged session cookies (original + page response Set-Cookie headers).
  * 2. Java youtube-transcript-api library — fast fallback for non-blocked IPs (no cookies).
  * 3. Throws FactCheckException → orchestrator falls back to full audio download + Groq.
  */
@@ -109,8 +109,7 @@ public class YouTubeTranscriptService {
                 return transcript;
             }
 
-            // CRITICAL: Do NOT return null. Mono.fromCallable(null) produces an empty Mono,
-            // which causes the downstream flatMap to never fire, leaving the SSE stream hanging forever.
+            // CRITICAL: Do NOT return null. Mono.fromCallable(null) produces an empty Mono.
             log.warn("All transcript methods failed for video {}", videoId);
             throw new FactCheckException(
                     "Could not get transcript for this YouTube video. " +
@@ -127,14 +126,18 @@ public class YouTubeTranscriptService {
     /**
      * Fetches subtitles directly via HTTP with cookie authentication.
      * Completely bypasses yt-dlp to avoid player client / format selection issues.
+     *
+     * Critical detail: YouTube's timedtext API requires BOTH the original cookies AND
+     * fresh session cookies set via Set-Cookie headers in the page response. We must
+     * merge them before making the caption download request.
      */
     private String fetchViaDirectHttp(String videoId) {
         try {
             log.debug("Trying direct HTTP subtitle fetch for video {}", videoId);
 
             // Step 1: Build cookie header from Netscape cookie file
-            String cookieHeader = buildCookieHeader();
-            if (cookieHeader == null || cookieHeader.isBlank()) {
+            String originalCookieHeader = buildCookieHeader();
+            if (originalCookieHeader == null || originalCookieHeader.isBlank()) {
                 log.debug("No cookies available for direct HTTP fetch");
                 return null;
             }
@@ -147,7 +150,7 @@ public class YouTubeTranscriptService {
             // Step 2: Fetch the YouTube page with cookies
             HttpRequest pageRequest = HttpRequest.newBuilder()
                     .uri(URI.create("https://www.youtube.com/watch?v=" + videoId))
-                    .header("Cookie", cookieHeader)
+                    .header("Cookie", originalCookieHeader)
                     .header("User-Agent", USER_AGENT)
                     .header("Accept-Language", "en-US,en;q=0.9")
                     .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -165,14 +168,21 @@ public class YouTubeTranscriptService {
             String html = pageResponse.body();
             log.debug("YouTube page fetched: {} chars for video {}", html.length(), videoId);
 
-            // Step 3: Extract ytInitialPlayerResponse JSON from HTML
+            // Step 3: CRITICAL — merge original cookies with new session cookies from page response.
+            // YouTube's timedtext API returns empty body (200 OK, 0 bytes) without these fresh cookies.
+            String mergedCookieHeader = mergeCookiesFromResponse(originalCookieHeader, pageResponse);
+            int newCookieCount = countCookies(mergedCookieHeader) - countCookies(originalCookieHeader);
+            log.debug("Merged cookies: {} original + {} new from Set-Cookie = {} total",
+                    countCookies(originalCookieHeader), Math.max(0, newCookieCount), countCookies(mergedCookieHeader));
+
+            // Step 4: Extract ytInitialPlayerResponse JSON from HTML
             String playerResponseJson = extractJsonFromHtml(html, "ytInitialPlayerResponse");
             if (playerResponseJson == null) {
                 log.debug("Could not find ytInitialPlayerResponse in page for video {}", videoId);
                 return null;
             }
 
-            // Step 4: Parse caption tracks from the JSON
+            // Step 5: Parse caption tracks from the JSON
             JsonNode playerResponse = objectMapper.readTree(playerResponseJson);
             JsonNode captionTracks = playerResponse
                     .path("captions")
@@ -195,7 +205,7 @@ public class YouTubeTranscriptService {
                         truncateUrl(track.path("baseUrl").asText("")));
             }
 
-            // Step 5: Find the best caption track URL
+            // Step 6: Find the best caption track URL
             String captionUrl = findEnglishCaptionUrl(captionTracks);
             if (captionUrl == null) {
                 log.debug("No suitable caption URL found for video {}", videoId);
@@ -209,20 +219,25 @@ public class YouTubeTranscriptService {
 
             log.debug("Using caption URL: {}", truncateUrl(captionUrl));
 
-            // Step 6: Try downloading captions in multiple formats
-            // Try JSON3 first (easier to parse), then fall back to srv3 XML
-            String text = downloadCaptions(client, captionUrl, cookieHeader, videoId, "json3");
+            // Step 7: Try downloading captions with merged cookies in multiple formats
+            String text = downloadCaptions(client, captionUrl, mergedCookieHeader, videoId, "json3");
 
             if (text == null || text.isBlank()) {
                 log.debug("JSON3 format returned no text, trying srv3 (XML) for video {}", videoId);
-                text = downloadCaptions(client, captionUrl, cookieHeader, videoId, "srv3");
+                text = downloadCaptions(client, captionUrl, mergedCookieHeader, videoId, "srv3");
+            }
+
+            // Try without fmt parameter (default YouTube format)
+            if (text == null || text.isBlank()) {
+                log.debug("Trying default format (no fmt param) for video {}", videoId);
+                text = downloadCaptionsRaw(client, captionUrl, mergedCookieHeader, videoId);
             }
 
             // If still no text, try with English translation (for non-English captions)
             if (text == null || text.isBlank()) {
                 log.debug("Trying English translation for video {}", videoId);
                 String tlangUrl = appendParam(captionUrl, "tlang", "en");
-                text = downloadCaptions(client, tlangUrl, cookieHeader, videoId, "json3");
+                text = downloadCaptions(client, tlangUrl, mergedCookieHeader, videoId, "json3");
             }
 
             if (text != null && !text.isBlank()) {
@@ -239,6 +254,54 @@ public class YouTubeTranscriptService {
     }
 
     /**
+     * Merges original cookies with new cookies from Set-Cookie response headers.
+     * New cookies override existing ones with the same name.
+     */
+    private String mergeCookiesFromResponse(String originalCookieHeader, HttpResponse<?> response) {
+        // Parse original cookies into an ordered map
+        Map<String, String> cookieMap = new LinkedHashMap<>();
+        if (originalCookieHeader != null) {
+            for (String pair : originalCookieHeader.split("; ")) {
+                int eq = pair.indexOf('=');
+                if (eq > 0) {
+                    cookieMap.put(pair.substring(0, eq).trim(), pair.substring(eq + 1));
+                }
+            }
+        }
+
+        // Parse Set-Cookie headers from response and merge
+        List<String> setCookieHeaders = response.headers().allValues("set-cookie");
+        log.debug("Page response contained {} Set-Cookie headers", setCookieHeaders.size());
+
+        for (String setCookie : setCookieHeaders) {
+            // Set-Cookie format: "name=value; Path=/; Domain=.youtube.com; Secure; HttpOnly"
+            // We only need the name=value part (before the first semicolon)
+            String nameValue = setCookie.split(";")[0].trim();
+            int eq = nameValue.indexOf('=');
+            if (eq > 0) {
+                String name = nameValue.substring(0, eq).trim();
+                String value = nameValue.substring(eq + 1);
+                cookieMap.put(name, value);
+                log.debug("Set-Cookie merged: {}={}", name,
+                        value.length() > 30 ? value.substring(0, 30) + "..." : value);
+            }
+        }
+
+        // Rebuild cookie header
+        return cookieMap.entrySet().stream()
+                .map(e -> e.getKey() + "=" + e.getValue())
+                .collect(Collectors.joining("; "));
+    }
+
+    /**
+     * Counts cookies in a cookie header string.
+     */
+    private int countCookies(String cookieHeader) {
+        if (cookieHeader == null || cookieHeader.isBlank()) return 0;
+        return cookieHeader.split("; ").length;
+    }
+
+    /**
      * Downloads and parses captions from the given URL in the specified format.
      */
     private String downloadCaptions(HttpClient client, String baseUrl, String cookieHeader,
@@ -251,6 +314,8 @@ public class YouTubeTranscriptService {
                     .header("Cookie", cookieHeader)
                     .header("User-Agent", USER_AGENT)
                     .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Referer", "https://www.youtube.com/watch?v=" + videoId)
+                    .header("Origin", "https://www.youtube.com")
                     .timeout(Duration.ofSeconds(15))
                     .GET()
                     .build();
@@ -260,15 +325,11 @@ public class YouTubeTranscriptService {
             log.debug("Caption download (fmt={}) status={}, body length={} for video {}",
                     format, response.statusCode(), response.body().length(), videoId);
 
-            if (response.statusCode() != 200) {
-                log.debug("Caption download returned status {} for video {} (fmt={})",
-                        response.statusCode(), videoId, format);
+            if (response.statusCode() != 200 || response.body().isEmpty()) {
                 return null;
             }
 
             String body = response.body();
-
-            // Log first 200 chars of response for debugging
             log.debug("Caption response preview (fmt={}): {}", format,
                     body.length() > 200 ? body.substring(0, 200) + "..." : body);
 
@@ -295,6 +356,55 @@ public class YouTubeTranscriptService {
     }
 
     /**
+     * Downloads captions from the raw URL (no fmt parameter) and tries to auto-detect format.
+     */
+    private String downloadCaptionsRaw(HttpClient client, String baseUrl, String cookieHeader, String videoId) {
+        try {
+            HttpRequest captionRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl))
+                    .header("Cookie", cookieHeader)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Referer", "https://www.youtube.com/watch?v=" + videoId)
+                    .header("Origin", "https://www.youtube.com")
+                    .timeout(Duration.ofSeconds(15))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = client.send(captionRequest, HttpResponse.BodyHandlers.ofString());
+
+            log.debug("Caption download (raw) status={}, body length={} for video {}",
+                    response.statusCode(), response.body().length(), videoId);
+
+            if (response.statusCode() != 200 || response.body().isEmpty()) {
+                return null;
+            }
+
+            String body = response.body();
+            log.debug("Caption raw response preview: {}",
+                    body.length() > 300 ? body.substring(0, 300) + "..." : body);
+
+            // Auto-detect format: JSON starts with {, XML starts with < or <?
+            String text;
+            if (body.trim().startsWith("{")) {
+                text = parseCaptionJson3(body);
+            } else {
+                text = parseCaptionXml(body);
+            }
+
+            if (text != null && !text.isBlank()) {
+                log.debug("Parsed {} chars of transcript text (raw) for video {}", text.length(), videoId);
+            }
+
+            return text;
+        } catch (Exception e) {
+            log.debug("Caption raw download error for {}: {} ({})",
+                    videoId, e.getMessage(), e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
      * Extracts a JSON object assigned to a variable name from YouTube page HTML.
      * Uses brace-counting to correctly handle nested JSON.
      */
@@ -302,11 +412,9 @@ public class YouTubeTranscriptService {
         int startIdx = html.indexOf(variableName);
         if (startIdx == -1) return null;
 
-        // Find the first '{' after the variable name
         int jsonStart = html.indexOf('{', startIdx);
         if (jsonStart == -1) return null;
 
-        // Use brace-counting to find the matching closing '}'
         int depth = 0;
         boolean inString = false;
         boolean escaped = false;
@@ -377,12 +485,11 @@ public class YouTubeTranscriptService {
 
         if (englishManualUrl != null) return englishManualUrl;
         if (englishAutoUrl != null) return englishAutoUrl;
-        return anyUrl; // Will use translation for non-English
+        return anyUrl;
     }
 
     /**
      * Parses YouTube's JSON3 caption format into plain text.
-     * JSON3 structure: { "events": [{ "segs": [{ "utf8": "text" }] }] }
      */
     private String parseCaptionJson3(String jsonContent) {
         try {
@@ -425,13 +532,9 @@ public class YouTubeTranscriptService {
 
     /**
      * Parses YouTube's srv3 XML caption format into plain text.
-     * XML structure: <transcript><text start="0" dur="1.5">Hello</text>...</transcript>
-     * Falls back to simple regex parsing to avoid XML parser dependency issues.
      */
     private String parseCaptionXml(String xmlContent) {
         try {
-            // Simple regex-based XML text extraction
-            // Matches content between <text ...> and </text> tags
             StringBuilder text = new StringBuilder();
             int idx = 0;
             int segCount = 0;
@@ -442,16 +545,15 @@ public class YouTubeTranscriptService {
 
                 int contentStart = xmlContent.indexOf(">", tagStart);
                 if (contentStart == -1) break;
-                contentStart++; // Move past '>'
+                contentStart++;
 
                 int contentEnd = xmlContent.indexOf("</text>", contentStart);
                 if (contentEnd == -1) break;
 
                 String segText = xmlContent.substring(contentStart, contentEnd)
-                        .replaceAll("<[^>]+>", "") // Remove nested tags like <font>
+                        .replaceAll("<[^>]+>", "")
                         .trim();
 
-                // Decode HTML entities
                 segText = decodeHtmlEntities(segText);
 
                 if (!segText.isBlank()) {
@@ -459,7 +561,7 @@ public class YouTubeTranscriptService {
                     segCount++;
                 }
 
-                idx = contentEnd + 7; // Move past "</text>"
+                idx = contentEnd + 7;
             }
 
             log.debug("XML (srv3): extracted {} text segments", segCount);
@@ -490,17 +592,11 @@ public class YouTubeTranscriptService {
                 .replace("&#x2F;", "/");
     }
 
-    /**
-     * Appends a query parameter to a URL, handling existing query strings.
-     */
     private String appendParam(String url, String key, String value) {
         String separator = url.contains("?") ? "&" : "?";
         return url + separator + key + "=" + value;
     }
 
-    /**
-     * Truncates a URL for log output (hide sensitive tokens).
-     */
     private String truncateUrl(String url) {
         if (url == null) return "null";
         if (url.length() <= 120) return url;
@@ -509,7 +605,6 @@ public class YouTubeTranscriptService {
 
     /**
      * Builds an HTTP Cookie header string from the Netscape cookie file.
-     * Only includes cookies for youtube.com and google.com domains.
      */
     private String buildCookieHeader() {
         if (cookiesPath == null || cookiesPath.isBlank()) return null;
@@ -529,7 +624,6 @@ public class YouTubeTranscriptService {
                     String name = parts[5];
                     String value = parts[6];
 
-                    // Only include YouTube/Google cookies
                     if (domain.contains("youtube.com") || domain.contains(".google.com")) {
                         cookies.add(name + "=" + value);
                     }
@@ -549,10 +643,6 @@ public class YouTubeTranscriptService {
     // Strategy 2: Java youtube-transcript-api (no cookies, for non-blocked IPs)
     // ========================================================================
 
-    /**
-     * Uses the Java youtube-transcript-api library (no cookies, fast).
-     * Works when YouTube isn't blocking the server IP.
-     */
     private String fetchViaTranscriptApi(String videoId) {
         try {
             log.debug("Trying Java transcript API for video {}", videoId);
@@ -560,19 +650,16 @@ public class YouTubeTranscriptService {
 
             TranscriptContent content = null;
 
-            // Try English transcript
             try {
                 content = transcriptList.findTranscript("en", "en-US", "en-GB").fetch();
             } catch (Exception ignored) {}
 
-            // Try auto-generated English
             if (content == null) {
                 try {
                     content = transcriptList.findGeneratedTranscript("en", "en-US", "en-GB").fetch();
                 } catch (Exception ignored) {}
             }
 
-            // Try any available transcript and translate
             if (content == null) {
                 try {
                     var anyTranscript = transcriptList.iterator().next();
