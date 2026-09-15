@@ -15,9 +15,11 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.net.URI;
+import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -96,7 +98,6 @@ public class YouTubeTranscriptService {
             log.info("Fetching YouTube transcript for video ID: {}", videoId);
 
             // Strategy 1: Direct HTTP fetch — bypasses yt-dlp and its player client issues entirely.
-            // Downloads the YouTube page with cookies, extracts caption data from the page HTML.
             String transcript = fetchViaDirectHttp(videoId);
             if (transcript != null && !transcript.isBlank()) {
                 return transcript;
@@ -108,7 +109,7 @@ public class YouTubeTranscriptService {
                 return transcript;
             }
 
-            // CRITICAL: Do NOT return null here. Mono.fromCallable(null) produces an empty Mono,
+            // CRITICAL: Do NOT return null. Mono.fromCallable(null) produces an empty Mono,
             // which causes the downstream flatMap to never fire, leaving the SSE stream hanging forever.
             log.warn("All transcript methods failed for video {}", videoId);
             throw new FactCheckException(
@@ -125,16 +126,7 @@ public class YouTubeTranscriptService {
 
     /**
      * Fetches subtitles directly via HTTP with cookie authentication.
-     * This completely bypasses yt-dlp, avoiding all player client / format selection
-     * issues that plague datacenter IPs.
-     *
-     * How it works:
-     * 1. Load cookies from the Netscape cookie file
-     * 2. GET the YouTube page with cookies (this always succeeds with valid cookies)
-     * 3. Extract the ytInitialPlayerResponse JSON embedded in the page HTML
-     * 4. Parse caption track URLs from the JSON
-     * 5. Download the actual caption content
-     * 6. Parse and return plain text
+     * Completely bypasses yt-dlp to avoid player client / format selection issues.
      */
     private String fetchViaDirectHttp(String videoId) {
         try {
@@ -194,44 +186,110 @@ public class YouTubeTranscriptService {
 
             log.debug("Found {} caption tracks for video {}", captionTracks.size(), videoId);
 
-            // Step 5: Find the best English caption track
+            // Log all available caption tracks for debugging
+            for (JsonNode track : captionTracks) {
+                log.debug("Caption track: lang={}, kind={}, name={}, baseUrl={}",
+                        track.path("languageCode").asText("?"),
+                        track.path("kind").asText("?"),
+                        track.path("name").path("simpleText").asText(track.path("name").asText("?")),
+                        truncateUrl(track.path("baseUrl").asText("")));
+            }
+
+            // Step 5: Find the best caption track URL
             String captionUrl = findEnglishCaptionUrl(captionTracks);
             if (captionUrl == null) {
                 log.debug("No suitable caption URL found for video {}", videoId);
                 return null;
             }
 
-            // Request JSON3 format for easier parsing
-            String separator = captionUrl.contains("?") ? "&" : "?";
-            captionUrl = captionUrl + separator + "fmt=json3";
-
-            // Step 6: Download the caption content
-            HttpRequest captionRequest = HttpRequest.newBuilder()
-                    .uri(URI.create(captionUrl))
-                    .header("Cookie", cookieHeader)
-                    .header("User-Agent", USER_AGENT)
-                    .timeout(Duration.ofSeconds(15))
-                    .GET()
-                    .build();
-
-            HttpResponse<String> captionResponse = client.send(captionRequest, HttpResponse.BodyHandlers.ofString());
-
-            if (captionResponse.statusCode() != 200) {
-                log.debug("Caption download returned status {} for video {}", captionResponse.statusCode(), videoId);
-                return null;
+            // Ensure absolute URL (YouTube sometimes uses relative URLs)
+            if (captionUrl.startsWith("/")) {
+                captionUrl = "https://www.youtube.com" + captionUrl;
             }
 
-            // Step 7: Parse the caption JSON3 format to plain text
-            String text = parseCaptionJson3(captionResponse.body());
+            log.debug("Using caption URL: {}", truncateUrl(captionUrl));
+
+            // Step 6: Try downloading captions in multiple formats
+            // Try JSON3 first (easier to parse), then fall back to srv3 XML
+            String text = downloadCaptions(client, captionUrl, cookieHeader, videoId, "json3");
+
+            if (text == null || text.isBlank()) {
+                log.debug("JSON3 format returned no text, trying srv3 (XML) for video {}", videoId);
+                text = downloadCaptions(client, captionUrl, cookieHeader, videoId, "srv3");
+            }
+
+            // If still no text, try with English translation (for non-English captions)
+            if (text == null || text.isBlank()) {
+                log.debug("Trying English translation for video {}", videoId);
+                String tlangUrl = appendParam(captionUrl, "tlang", "en");
+                text = downloadCaptions(client, tlangUrl, cookieHeader, videoId, "json3");
+            }
 
             if (text != null && !text.isBlank()) {
                 log.info("YouTube transcript via direct HTTP: {} chars for video {}", text.length(), videoId);
                 return text;
             }
 
+            log.debug("Direct HTTP fetch produced no usable text for video {}", videoId);
             return null;
         } catch (Exception e) {
-            log.debug("Direct HTTP subtitle fetch error for {}: {}", videoId, e.getMessage());
+            log.warn("Direct HTTP subtitle fetch error for {}: {} ({})", videoId, e.getMessage(), e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * Downloads and parses captions from the given URL in the specified format.
+     */
+    private String downloadCaptions(HttpClient client, String baseUrl, String cookieHeader,
+                                     String videoId, String format) {
+        try {
+            String url = appendParam(baseUrl, "fmt", format);
+
+            HttpRequest captionRequest = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Cookie", cookieHeader)
+                    .header("User-Agent", USER_AGENT)
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .timeout(Duration.ofSeconds(15))
+                    .GET()
+                    .build();
+
+            HttpResponse<String> response = client.send(captionRequest, HttpResponse.BodyHandlers.ofString());
+
+            log.debug("Caption download (fmt={}) status={}, body length={} for video {}",
+                    format, response.statusCode(), response.body().length(), videoId);
+
+            if (response.statusCode() != 200) {
+                log.debug("Caption download returned status {} for video {} (fmt={})",
+                        response.statusCode(), videoId, format);
+                return null;
+            }
+
+            String body = response.body();
+
+            // Log first 200 chars of response for debugging
+            log.debug("Caption response preview (fmt={}): {}", format,
+                    body.length() > 200 ? body.substring(0, 200) + "..." : body);
+
+            // Parse based on format
+            String text;
+            if ("json3".equals(format)) {
+                text = parseCaptionJson3(body);
+            } else {
+                text = parseCaptionXml(body);
+            }
+
+            if (text != null && !text.isBlank()) {
+                log.debug("Parsed {} chars of transcript text (fmt={}) for video {}", text.length(), format, videoId);
+            } else {
+                log.debug("Caption parsing returned empty text (fmt={}) for video {}", format, videoId);
+            }
+
+            return text;
+        } catch (Exception e) {
+            log.debug("Caption download error (fmt={}) for {}: {} ({})",
+                    format, videoId, e.getMessage(), e.getClass().getSimpleName());
             return null;
         }
     }
@@ -241,7 +299,6 @@ public class YouTubeTranscriptService {
      * Uses brace-counting to correctly handle nested JSON.
      */
     private String extractJsonFromHtml(String html, String variableName) {
-        // Try patterns: "var NAME = {...};" and "NAME = {...};"
         int startIdx = html.indexOf(variableName);
         if (startIdx == -1) return null;
 
@@ -290,11 +347,12 @@ public class YouTubeTranscriptService {
     }
 
     /**
-     * Finds the best English caption URL from a list of caption tracks.
-     * Prefers manual English captions, then auto-generated, then any language.
+     * Finds the best caption URL from a list of caption tracks.
+     * Priority: manual English > auto-generated English > any language.
      */
     private String findEnglishCaptionUrl(JsonNode captionTracks) {
-        String englishUrl = null;
+        String englishManualUrl = null;
+        String englishAutoUrl = null;
         String anyUrl = null;
 
         for (JsonNode track : captionTracks) {
@@ -302,15 +360,13 @@ public class YouTubeTranscriptService {
             String kind = track.path("kind").asText("");
             String baseUrl = track.path("baseUrl").asText(null);
 
-            if (baseUrl == null) continue;
+            if (baseUrl == null || baseUrl.isBlank()) continue;
 
             if (langCode.startsWith("en")) {
-                if (!"asr".equals(kind)) {
-                    // Prefer manual English captions (not auto-generated)
-                    return baseUrl;
-                }
-                if (englishUrl == null) {
-                    englishUrl = baseUrl;
+                if (!"asr".equals(kind) && englishManualUrl == null) {
+                    englishManualUrl = baseUrl;
+                } else if (englishAutoUrl == null) {
+                    englishAutoUrl = baseUrl;
                 }
             }
 
@@ -319,7 +375,9 @@ public class YouTubeTranscriptService {
             }
         }
 
-        return englishUrl != null ? englishUrl : anyUrl;
+        if (englishManualUrl != null) return englishManualUrl;
+        if (englishAutoUrl != null) return englishAutoUrl;
+        return anyUrl; // Will use translation for non-English
     }
 
     /**
@@ -330,9 +388,15 @@ public class YouTubeTranscriptService {
         try {
             JsonNode root = objectMapper.readTree(jsonContent);
             JsonNode events = root.path("events");
-            if (events.isMissingNode() || !events.isArray()) return null;
+            if (events.isMissingNode() || !events.isArray()) {
+                log.debug("JSON3: 'events' field missing or not an array");
+                return null;
+            }
+
+            log.debug("JSON3: found {} events", events.size());
 
             StringBuilder text = new StringBuilder();
+            int segCount = 0;
             for (JsonNode event : events) {
                 JsonNode segs = event.path("segs");
                 if (segs.isArray()) {
@@ -340,10 +404,13 @@ public class YouTubeTranscriptService {
                         String segText = seg.path("utf8").asText("");
                         if (!segText.isBlank() && !segText.equals("\n")) {
                             text.append(segText).append(" ");
+                            segCount++;
                         }
                     }
                 }
             }
+
+            log.debug("JSON3: extracted {} non-empty segments", segCount);
 
             return text.toString()
                     .replaceAll("\\[Music\\]", "")
@@ -351,9 +418,93 @@ public class YouTubeTranscriptService {
                     .replaceAll("\\s+", " ")
                     .trim();
         } catch (Exception e) {
-            log.debug("Failed to parse caption JSON3: {}", e.getMessage());
+            log.debug("Failed to parse caption JSON3: {} ({})", e.getMessage(), e.getClass().getSimpleName());
             return null;
         }
+    }
+
+    /**
+     * Parses YouTube's srv3 XML caption format into plain text.
+     * XML structure: <transcript><text start="0" dur="1.5">Hello</text>...</transcript>
+     * Falls back to simple regex parsing to avoid XML parser dependency issues.
+     */
+    private String parseCaptionXml(String xmlContent) {
+        try {
+            // Simple regex-based XML text extraction
+            // Matches content between <text ...> and </text> tags
+            StringBuilder text = new StringBuilder();
+            int idx = 0;
+            int segCount = 0;
+
+            while (idx < xmlContent.length()) {
+                int tagStart = xmlContent.indexOf("<text", idx);
+                if (tagStart == -1) break;
+
+                int contentStart = xmlContent.indexOf(">", tagStart);
+                if (contentStart == -1) break;
+                contentStart++; // Move past '>'
+
+                int contentEnd = xmlContent.indexOf("</text>", contentStart);
+                if (contentEnd == -1) break;
+
+                String segText = xmlContent.substring(contentStart, contentEnd)
+                        .replaceAll("<[^>]+>", "") // Remove nested tags like <font>
+                        .trim();
+
+                // Decode HTML entities
+                segText = decodeHtmlEntities(segText);
+
+                if (!segText.isBlank()) {
+                    text.append(segText).append(" ");
+                    segCount++;
+                }
+
+                idx = contentEnd + 7; // Move past "</text>"
+            }
+
+            log.debug("XML (srv3): extracted {} text segments", segCount);
+
+            return text.toString()
+                    .replaceAll("\\[Music\\]", "")
+                    .replaceAll("\\[Applause\\]", "")
+                    .replaceAll("\\s+", " ")
+                    .trim();
+        } catch (Exception e) {
+            log.debug("Failed to parse caption XML: {} ({})", e.getMessage(), e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * Decodes common HTML entities in caption text.
+     */
+    private String decodeHtmlEntities(String text) {
+        return text
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&apos;", "'")
+                .replace("&#x27;", "'")
+                .replace("&#x2F;", "/");
+    }
+
+    /**
+     * Appends a query parameter to a URL, handling existing query strings.
+     */
+    private String appendParam(String url, String key, String value) {
+        String separator = url.contains("?") ? "&" : "?";
+        return url + separator + key + "=" + value;
+    }
+
+    /**
+     * Truncates a URL for log output (hide sensitive tokens).
+     */
+    private String truncateUrl(String url) {
+        if (url == null) return "null";
+        if (url.length() <= 120) return url;
+        return url.substring(0, 120) + "...[truncated]";
     }
 
     /**
